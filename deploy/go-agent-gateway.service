@@ -1,0 +1,21 @@
+# 可选原生部署；先创建专用 gateway 用户和 /etc/go-agent-gateway/env。
+[Unit]
+Description=go-agent-gateway
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=gateway
+Group=gateway
+WorkingDirectory=/opt/go-agent-gateway
+EnvironmentFile=/etc/go-agent-gateway/env
+ExecStart=/opt/go-agent-gateway/bin/server -config deploy/config.prod.yaml
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=25
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/go-agent-gateway/data
+[Install]
+WantedBy=multi-user.target

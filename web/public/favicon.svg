@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Agent Gateway">
+  <rect width="32" height="32" rx="9" fill="#4d6bfe" />
+  <path
+    d="M16 6.2c.35 4.8 2.5 7.05 7.3 7.4-4.8.35-6.95 2.6-7.3 7.4-.35-4.8-2.5-7.05-7.3-7.4 4.8-.35 6.95-2.6 7.3-7.4Z"
+    fill="#ffffff"
+  />
+  <path
+    d="M23.1 19.6c.18 2.4 1.25 3.52 3.65 3.7-2.4.18-3.47 1.3-3.65 3.7-.18-2.4-1.25-3.52-3.65-3.7 2.4-.18 3.47-1.3 3.65-3.7Z"
+    fill="#ffffff"
+    fill-opacity=".62"
+  />
+</svg>

@@ -1,0 +1,17 @@
+title = "go-agent-gateway public source policy"
+[extend]
+useDefault = true
+[allowlist]
+description = "Local artifacts and explicit tutorial-only credentials"
+paths = [
+  '''(^|/)(\.git|\.local-docs|docs|tmp|dist|bin|data|node_modules|\.idea|\.cache)/''',
+  '''(^|/)\.env$''',
+  '''(^|/)config\.local\.yaml$'''
+]
+regexes = [
+  '''gateway-local-only''',
+  '''gateway-root-local-only''',
+  '''gateway-local-password''',
+  '''local-tutorial-session-secret-change-before-public''',
+  '''local-test-access-password'''
+]

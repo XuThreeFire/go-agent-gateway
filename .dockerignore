@@ -1,0 +1,14 @@
+.git
+.idea
+.DS_Store
+.env
+.env.*
+**/config.local.yaml
+.local-docs
+docs
+dist
+bin
+tmp
+data
+web/node_modules
+web/dist

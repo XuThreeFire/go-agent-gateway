@@ -1,0 +1,1 @@
+ALTER TABLE run MODIFY COLUMN error_category VARCHAR(32) NULL COMMENT '执行错误分类';

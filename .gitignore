@@ -1,0 +1,44 @@
+# macOS
+.DS_Store
+
+# Go
+/bin/
+backend/bin/
+cli/bin/
+# 忘记加 -o 时 go build 会把二进制吐在包目录里
+/cli/cli
+/backend/server
+*.test
+*.out
+coverage.html
+
+# 前端
+node_modules/
+web/dist/
+.pnpm-store/
+
+# 配置与密钥：供应商 key 绝不入库
+.env
+.env.*
+!.env.example
+config.local.yaml
+
+# 日志与临时文件
+*.log
+tmp/
+
+# 发布产物（交叉编译的二进制与渲染后的生产配置，含库密码，绝不入库）
+/dist/
+
+# 个人知识、任务记录与编辑器状态不发布
+/docs/
+/.local-docs/
+/.idea/
+/.cache/
+/data/
+*.sql.gz
+*.dump
+# CLI 身份相当于会话凭据
+.gateway-session
+__pycache__/
+*.pyc

@@ -1,0 +1,21 @@
+# 设置 GATEWAY_DOMAIN，例 agent.example.com；应用端口仅对回环开放。
+{$GATEWAY_DOMAIN} {
+  # 先验证顶层页面访问，使浏览器能正常显示 Basic 登录提示。
+  @protected not path /healthz
+  forward_auth @protected 127.0.0.1:8080 {
+    uri /api/session
+  }
+  handle /api/* {
+    reverse_proxy 127.0.0.1:8080 {
+      flush_interval -1
+    }
+  }
+  handle /healthz {
+    reverse_proxy 127.0.0.1:8080
+  }
+  handle {
+    root * /opt/go-agent-gateway/web
+    try_files {path} /index.html
+    file_server
+  }
+}

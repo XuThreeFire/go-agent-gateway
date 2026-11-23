@@ -1,0 +1,60 @@
+name: Verify tutorial
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-local-only
+          MYSQL_DATABASE: go_agent_gateway_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci-local-only"
+          --health-interval=5s --health-timeout=3s --health-retries=30
+    env:
+      GATEWAY_TEST_DATABASE_URL: mysql://root:ci-local-only@127.0.0.1:3306/go_agent_gateway_test?parseTime=true&loc=UTC
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          cache-dependency-path: |
+            backend/go.sum
+            cli/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: make tools web-install
+      - run: DATABASE_URL="$GATEWAY_TEST_DATABASE_URL" make migrate-local
+      - run: DATABASE_URL="$GATEWAY_TEST_DATABASE_URL" make migrate-local
+      - run: make release-check
+      - run: go test -race -cover ./backend/... ./cli/...
+        env:
+          GOCACHE: ${{ github.workspace }}/tmp/go-build
+          GOMODCACHE: ${{ github.workspace }}/tmp/go-mod
+      - run: bin/gitleaks git --redact --no-banner --config .gitleaks.toml .
+      - run: make agent-demo
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet
+      - run: docker compose up -d --build --wait --wait-timeout 300
+      - run: curl --fail --max-time 10 http://127.0.0.1:8080/healthz
+      - name: Check browser authentication entry
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)" = 401
+          curl --fail --user gateway:gateway-local-password --max-time 10 http://127.0.0.1:8080/ > /dev/null
+      - if: always()
+        run: docker compose logs --no-color
+      - if: always()
+        run: docker compose down -v

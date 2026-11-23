@@ -1,0 +1,58 @@
+name: go-agent-gateway
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-go_agent_gateway}
+      MYSQL_USER: ${MYSQL_USER:-gateway}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-gateway-local-only}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-gateway-root-local-only}
+    ports:
+      - "127.0.0.1:13306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -u root --silent']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  migrate:
+    image: migrate/migrate:v4.18.3
+    volumes:
+      - ./backend/migrations:/migrations:ro
+    entrypoint: [migrate]
+    command: ["-path", "/migrations", "-database", "${DATABASE_URL:-mysql://gateway:gateway-local-only@mysql:3306/go_agent_gateway?parseTime=true&loc=UTC}", "up"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+  backend:
+    build:
+      context: .
+      target: backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-mysql://gateway:gateway-local-only@mysql:3306/go_agent_gateway?parseTime=true&loc=UTC}
+      GATEWAY_HTTP_ADDR: ":8080"
+      GATEWAY_SESSION_SECRET: ${GATEWAY_SESSION_SECRET:-local-tutorial-session-secret-change-before-public}
+      GATEWAY_ACCESS_PASSWORD: ${GATEWAY_ACCESS_PASSWORD:-gateway-local-password}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./backend/configs/dev/config.yaml:/app/backend/configs/dev/config.yaml:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  web:
+    build:
+      context: .
+      target: web
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+volumes:
+  mysql-data:
