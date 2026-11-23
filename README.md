@@ -4,6 +4,12 @@
 
 项目起于个人学习Agent过程中的想法，由作者与 AI 辅助设计，初版代码由 AI 编写。开源版面向有基本编程经验、尚未开发过 Agent 的读者；所有演示数据均为虚构数据。采用 [MIT 许可证](LICENSE)。
 
+## 在线演示
+
+访问 [在线演示](https://agent-gateway.sudaqiang.vip/)，体验 Agent 对话、工具调用和 SSE 流式输出。
+
+![go-agent-gateway 功能演示](演示视频.gif)
+
 ## 先体验：两条路线
 
 ### 路线 A：只装 Go，理解最小 Agent

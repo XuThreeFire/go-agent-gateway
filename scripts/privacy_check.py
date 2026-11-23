@@ -48,7 +48,7 @@ def check():
         try:
             content = path.read_text('utf-8')
         except UnicodeError:
-            if path.suffix.lower() not in {'.png', '.jpg', '.ico', '.woff2'}:
+            if path.suffix.lower() not in {'.png', '.jpg', '.gif', '.ico', '.woff2'}:
                 failures.append((relative, '存在未分类二进制产物'))
             continue
         if re.search(r'/(?:Users|home)/[A-Za-z0-9_.-]+/', content):
