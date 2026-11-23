@@ -1,14 +1,26 @@
 # go-agent-gateway
 
+<p align="center">
+  <strong>简体中文</strong> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.en.md">English</a> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a>
+</p>
+
+<p align="center">
+  <a href="https://agent-gateway.sudaqiang.vip/">在线演示</a> · <a href="handbook/tutorial/01-start.md">学习教程</a> · <a href="#quick-start">快速开始</a> · <a href="handbook/development/README.md">二次开发</a> · <a href="handbook/deployment.md">部署指南</a>
+</p>
+
 通过一个可运行的 Go + Vue 项目，学习 **Agent 工具调用、多轮上下文、SSE 流式输出，以及执行取消、重试和事件补发**。
 
-项目起于个人学习Agent过程中的想法，由作者与 AI 辅助设计，初版代码由 AI 编写。开源版面向有基本编程经验、尚未开发过 Agent 的读者；所有演示数据均为虚构数据。采用 [MIT 许可证](LICENSE)。
+项目起于个人学习 Agent 过程中的想法，由本人设计，没有采用agent 框架，代码由 AI 编写。开源版面向有基本编程经验、尚未开发过 Agent 的读者；所有演示数据均为虚构数据。采用 [MIT 许可证](LICENSE)。
+
+README 提供以上五种语言版本；`handbook/` 中的详细教程目前为简体中文。
 
 ## 在线演示
 
 访问 [在线演示](https://agent-gateway.sudaqiang.vip/)，体验 Agent 对话、工具调用和 SSE 流式输出。
 
 ![go-agent-gateway 功能演示](assets/演示视频.gif)
+
+<a id="quick-start"></a>
 
 ## 先体验：两条路线
 

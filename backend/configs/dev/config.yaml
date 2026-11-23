@@ -46,7 +46,7 @@ tools:
 quota:
   # 全局日软配额：不写默认 500 万，0 表示不限。
   daily_tokens_global: 5000000
-  daily_tokens_per_client: 0
+  daily_tokens_per_client: 100000
 hub:
   batch_size: 32
   flush_interval: 200ms
