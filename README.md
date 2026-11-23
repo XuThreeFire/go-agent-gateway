@@ -8,7 +8,7 @@
 
 访问 [在线演示](https://agent-gateway.sudaqiang.vip/)，体验 Agent 对话、工具调用和 SSE 流式输出。
 
-![go-agent-gateway 功能演示](演示视频.gif)
+![go-agent-gateway 功能演示](assets/演示视频.gif)
 
 ## 先体验：两条路线
 
@@ -58,6 +58,16 @@ docker compose down            # 停止，保留学习数据
 | 8 | [可靠性与成本](handbook/tutorial/08-reliability.md) | 执行测试，理解系统保障的边界 |
 
 继续阅读[二次开发指南](handbook/development/README.md)、[架构与数据模型](handbook/reference/architecture.md)、[HTTP/SSE 契约](handbook/reference/protocol.md)和[个人部署指南](handbook/deployment.md)。
+
+## 一起交流 Agent 开发
+
+我也是从一个个问题、一次次调试中开始学习 Agent 的。把这个项目开源，是希望把走通的路和踩过的坑分享出来，让更多人能亲手做出自己的 Agent。
+
+如果你在运行项目、阅读源码或二次开发时遇到疑问，欢迎扫码加我微信。一个没看懂的实现、一处卡住的报错，或一个想尝试的点子，都可以成为我们交流的起点；也欢迎分享你的实践，让我们一起把这个项目做得更好。
+
+添加时请备注 **「Agent 交流」**，我会邀请你加入 **Agent 交流群**，一起讨论问题、分享经验、交流新想法。希望你收获的不只是一个能跑起来的项目，还有一群可以一起探索的人。
+
+<img src="assets/个人微信.png" alt="作者微信二维码，添加时请备注 Agent 交流" width="240" />
 
 ## 当前范围
 
