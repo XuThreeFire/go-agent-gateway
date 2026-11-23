@@ -11,6 +11,7 @@ RUN apk add --no-cache ca-certificates wget && adduser -D -u 10001 gateway
 WORKDIR /app
 COPY --from=backend-build /server /app/server
 COPY backend/configs/dev/config.yaml /app/backend/configs/dev/config.yaml
+COPY backend/configs/prompts/ /app/backend/configs/prompts/
 COPY deploy/config.prod.yaml /app/deploy/config.prod.yaml
 RUN mkdir /app/data && chown gateway:gateway /app/data
 USER gateway

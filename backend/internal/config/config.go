@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,7 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 func (d Duration) Std() time.Duration { return time.Duration(d) }
 
 type Config struct {
+	Prompt   PromptConfig   `yaml:"prompt"`
 	Env      string         `yaml:"env"`
 	HTTP     HTTPConfig     `yaml:"http"`
 	Log      LogConfig      `yaml:"log"`
@@ -53,6 +55,18 @@ type Config struct {
 	Hub      HubConfig      `yaml:"hub"`
 	SSE      SSEConfig      `yaml:"sse"`
 	Security SecurityConfig `yaml:"security"`
+}
+
+// PromptConfig 的路径相对配置文件所在目录解析；留空沿用内联提示词。
+type PromptConfig struct {
+	SystemFile string `yaml:"system_file"`
+}
+
+func (p PromptConfig) ResolvePath(configPath string) string {
+	if p.SystemFile == "" || filepath.IsAbs(p.SystemFile) {
+		return p.SystemFile
+	}
+	return filepath.Join(filepath.Dir(configPath), p.SystemFile)
 }
 
 type SecurityConfig struct {
@@ -136,10 +150,21 @@ type ToolsConfig struct {
 	MaxResultBytes int      `yaml:"max_result_bytes"` // 结果截断上限，防止大结果烧 token、撑爆事件表
 }
 
-// QuotaConfig 配额按「客户端 + UTC 自然日」计，单位 token。
-// 0 表示不限——本地开发默认关掉，线上再开。
+// QuotaConfig 按 UTC 自然日统计客户端与全局软配额。
+// 客户端 0 表示不限；全局未配置默认 500 万，显式 0 表示不限。
 type QuotaConfig struct {
-	DailyTokensPerClient int64 `yaml:"daily_tokens_per_client"`
+	DailyTokensPerClient int64  `yaml:"daily_tokens_per_client"`
+	DailyTokensGlobal    *int64 `yaml:"daily_tokens_global"`
+}
+
+// 默认 500 万；显式 0 表示关闭全局日软配额。
+const DefaultDailyTokensGlobal int64 = 5_000_000
+
+func (q QuotaConfig) GlobalDailyLimit() int64 {
+	if q.DailyTokensGlobal == nil {
+		return DefaultDailyTokensGlobal
+	}
+	return *q.DailyTokensGlobal
 }
 
 type HubConfig struct {
@@ -276,11 +301,17 @@ func (c *Config) applyDefaults() {
 
 func (c *Config) validate() error {
 	var problems []string
-	if c.Executor.MaxConcurrentRuns < 1 || c.Executor.MaxSteps < 1 || c.Executor.MaxOutputTokens < 1 || c.Executor.MaxContextBytes < 1 || c.Executor.MaxRunTokens < 1 {
+	if c.Executor.MaxOutputTokens < 1 {
+		problems = append(problems, "executor.max_output_tokens 必须为正数")
+	}
+	if c.Executor.MaxConcurrentRuns < 1 || c.Executor.MaxSteps < 1 || c.Executor.MaxContextBytes < 1 || c.Executor.MaxRunTokens < 1 {
 		problems = append(problems, "executor 的并发、步数和预算必须为正数")
 	}
 	if c.LLM.MaxRetries < 0 || c.LLM.MaxRetries > 3 {
 		problems = append(problems, "llm.max_retries 必须在 0 到 3 之间")
+	}
+	if c.Quota.DailyTokensGlobal != nil && *c.Quota.DailyTokensGlobal < 0 {
+		problems = append(problems, "quota.daily_tokens_global 不能为负")
 	}
 	if c.Quota.DailyTokensPerClient < 0 {
 		problems = append(problems, "quota 不能为负数")

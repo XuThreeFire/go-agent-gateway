@@ -37,6 +37,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ./backend/configs/dev/config.yaml:/app/backend/configs/dev/config.yaml:ro
+      - ./backend/configs/prompts:/app/backend/configs/prompts:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

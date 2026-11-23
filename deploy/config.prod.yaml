@@ -29,6 +29,8 @@ llm:
       supports_tool_call: true
       context_window: 16000
       enabled: false
+prompt:
+  system_file: "../backend/configs/prompts/system.md"
 executor:
   max_concurrent_runs: 4
   max_steps: 8
@@ -42,6 +44,8 @@ tools:
   timeout: 10s
   max_result_bytes: 8192
 quota:
+  # 全局日软配额：不写默认 500 万，0 表示不限。
+  daily_tokens_global: 5000000
   daily_tokens_per_client: 200000
 hub:
   batch_size: 32

@@ -78,6 +78,15 @@ func TestMySQLTransactionsIdempotencyAndCAS(t *testing.T) {
 	if fresh.InputTokens != 12 || fresh.OutputTokens != 3 {
 		t.Fatal("Step 与 Run token 汇总不一致")
 	}
+	clientTokens, err := st.UsageTokens(ctx, store.ScopeClientDay, store.DayKey(client, time.Now()))
+	if err != nil || clientTokens != 15 {
+		t.Fatalf("客户端事务记账错误：%d %v", clientTokens, err)
+	}
+	globalTokens, err := st.UsageTokens(ctx, store.ScopeGlobalDay, store.GlobalDayKey(time.Now()))
+	if err != nil || globalTokens < 15 {
+		t.Fatalf("全局事务记账错误：%d %v", globalTokens, err)
+	}
+
 }
 func TestMySQLConcurrentCreateUsesUniqueIndex(t *testing.T) {
 	st := testutil.Database(t)

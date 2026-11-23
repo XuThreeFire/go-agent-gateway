@@ -6,12 +6,14 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // 配额用的 scope 常量。写成 scope + scope_key 两列而不是一张宽表，
 // 是为了以后加「按 Task 限」「按模型限」时不用改表结构。
 const (
 	ScopeClientDay = "client_day"
+	ScopeGlobalDay = "global_day"
 )
 
 // DayKey 把 UTC 日期拼进 scope_key：跨零点自然换一个计数器，
@@ -43,4 +45,15 @@ func (s *Store) ClientIDOfTask(ctx context.Context, taskID int64) (string, error
 		return "", ErrNotFound
 	}
 	return clientID, nil
+}
+
+func GlobalDayKey(at time.Time) string { return "all:" + at.UTC().Format("20060102") }
+
+// AddUsageTokens 供 AppendStep 使用同一事务写入各维度计数。
+func (s *Store) AddUsageTokens(ctx context.Context, scope, key string, delta int64) error {
+	if delta <= 0 {
+		return nil
+	}
+	row := usageRow{Scope: scope, ScopeKey: key, Tokens: delta}
+	return s.db.WithContext(ctx).Clauses(clause.OnConflict{DoUpdates: clause.Assignments(map[string]any{"tokens": gorm.Expr("tokens + ?", delta), "updated_at": s.db.NowFunc().UTC()})}).Create(&row).Error
 }

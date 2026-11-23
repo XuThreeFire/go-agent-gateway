@@ -289,3 +289,117 @@ func TestUpstreamErrorDoesNotExposeResponseBody(t *testing.T) {
 		t.Fatal("不得公开上游错误正文")
 	}
 }
+
+func TestBuildRequestKeepsSystemRole(t *testing.T) {
+	c := New(Target{Name: "t", UpstreamModel: "m"}, ClientOptions{}).(*openAICompat)
+	req := c.buildRequest(Request{Messages: []domain.Message{
+		{Role: domain.RoleSystem, Content: "只用一句话回答"},
+		{Role: domain.RoleUser, Content: "介绍一下自己"},
+	}})
+
+	if len(req.Messages) != 2 {
+		t.Fatalf("消息数 = %d", len(req.Messages))
+	}
+	if req.Messages[0].Role != "system" {
+		t.Fatalf("首条 role = %q，期望 system", req.Messages[0].Role)
+	}
+	if req.Messages[0].Content != "只用一句话回答" {
+		t.Fatalf("system 内容被改写: %q", req.Messages[0].Content)
+	}
+	if req.Messages[1].Role != "user" {
+		t.Fatalf("第二条 role = %q，期望 user", req.Messages[1].Role)
+	}
+}
+
+func TestStreamSendsProviderOutputLimit(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		wantKey  string
+		otherKey string
+	}{
+		{provider: "openai", wantKey: "max_completion_tokens", otherKey: "max_tokens"},
+		{provider: "deepseek", wantKey: "max_tokens", otherKey: "max_completion_tokens"},
+		{provider: "compatible", wantKey: "max_tokens", otherKey: "max_completion_tokens"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if string(body[tc.wantKey]) != "123" {
+					t.Errorf("%s=%s，期望123", tc.wantKey, body[tc.wantKey])
+				}
+				if _, exists := body[tc.otherKey]; exists {
+					t.Errorf("不应同时发送%s", tc.otherKey)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+			}))
+			defer srv.Close()
+			c := New(Target{Provider: tc.provider, BaseURL: srv.URL, APIKey: "test", UpstreamModel: "m"}, ClientOptions{})
+			_, err := c.Stream(context.Background(), Request{MaxOutputTokens: 123}, func(Chunk) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestStreamPreservesUsageAfterLaterError(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		tail          string
+		callbackError bool
+	}{
+		{name: "malformed chunk", tail: "data: invalid-json\n\n"},
+		{name: "callback error", callbackError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n")
+				fmt.Fprint(w, tc.tail)
+			}))
+			defer srv.Close()
+			c := New(Target{BaseURL: srv.URL, APIKey: "test", UpstreamModel: "m"}, ClientOptions{})
+			res, err := c.Stream(context.Background(), Request{}, func(chunk Chunk) error {
+				if tc.callbackError && chunk.Usage != nil {
+					return context.Canceled
+				}
+				return nil
+			})
+			if err == nil || res.Usage.InputTokens != 10 || res.Usage.OutputTokens != 5 {
+				t.Fatalf("流报错丢失已知用量: usage=%+v，err=%v", res.Usage, err)
+			}
+		})
+	}
+}
+
+func TestStreamReadsCachedTokens(t *testing.T) {
+	for _, usage := range []string{`{"prompt_tokens":20,"completion_tokens":3,"prompt_cache_hit_tokens":12}`, `{"prompt_tokens":20,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":12}}`} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "data: {\"choices\":[],\"usage\":%s}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", usage)
+		}))
+		c := New(Target{BaseURL: srv.URL, APIKey: "fixture-key", UpstreamModel: "fixture-model"}, ClientOptions{})
+		res, err := c.Stream(context.Background(), Request{}, func(Chunk) error { return nil })
+		srv.Close()
+		if err != nil || res.Usage.CachedTokens != 12 || res.Usage.InputTokens != 20 {
+			t.Fatalf("缓存用量解析错误：%+v %v", res.Usage, err)
+		}
+	}
+}
+
+func TestStreamNormalizesMissingToolArguments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-empty\",\"function\":{\"name\":\"now\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+	client := New(Target{BaseURL: server.URL, APIKey: "fixture-key", UpstreamModel: "fixture-model"}, ClientOptions{})
+	result, err := client.Stream(context.Background(), Request{}, func(Chunk) error { return nil })
+	if err != nil || len(result.ToolCalls) != 1 || result.ToolCalls[0].Arguments != "{}" {
+		t.Fatalf("空参数未规范化：%+v err=%v", result, err)
+	}
+}

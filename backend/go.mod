@@ -3,6 +3,7 @@ module github.com/XuThreeFire/go-agent-gateway/backend
 go 1.22
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/gorm v1.31.2

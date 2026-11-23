@@ -18,6 +18,7 @@ import (
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/exec"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/hub"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/llm"
+	"github.com/XuThreeFire/go-agent-gateway/backend/internal/prompt"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/store"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/tool"
 )
@@ -29,6 +30,8 @@ var version = "dev"
 func main() {
 	configPath := flag.String("config", envOr("CONFIG_PATH", "backend/configs/dev/config.yaml"), "配置文件路径")
 	check := flag.Bool("check", false, "只检查配置和数据库连接，不启动服务")
+	llmProxy := flag.String("llm-proxy", envOr("LLM_PROXY", ""), "LLM 出站代理：空=环境变量，off=直连，其他为代理 URL")
+	llmInsecure := flag.Bool("llm-proxy-insecure", false, "仅本地调试：跳过上游 TLS 证书校验")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -37,8 +40,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	proxyURL, err := parseLLMProxy(*llmProxy)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "LLM 代理配置错误：", err)
+		os.Exit(1)
+	}
+	if err := validateLLMDebug(cfg.Env, proxyURL, *llmInsecure); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	sysPrompt, err := prompt.New(cfg.Prompt.ResolvePath(*configPath))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "加载 system 提示词失败，请检查配置的文件路径与内容")
+		os.Exit(1)
+	}
 	logger := newLogger(cfg.Log)
 	slog.SetDefault(logger)
+	if proxyURL != nil || *llmInsecure {
+		logger.Warn("LLM 调试出站配置已启用", "proxy", proxyLabel(proxyURL), "insecureTLS", *llmInsecure)
+	}
 
 	dsn, err := cfg.Database.DSN()
 	if err != nil {
@@ -79,6 +99,7 @@ func main() {
 	// 所以执行器拿的是它，不是 request context。
 	root, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	watchPromptReload(root, sysPrompt, logger)
 
 	eventHub := hub.New(st, hub.Options{
 		BatchSize:       cfg.Hub.BatchSize,
@@ -94,6 +115,7 @@ func main() {
 		RequestTimeout:    cfg.LLM.RequestTimeout.Std(),
 		FirstTokenTimeout: cfg.LLM.FirstTokenTimeout.Std(),
 		MaxRetries:        cfg.LLM.MaxRetries,
+		Proxy:             proxyURL, InsecureSkipTLS: *llmInsecure,
 	})
 
 	// 工具在编译期注册，配置只能按名字关掉。写错名字不会让模型拿到新能力，
@@ -111,6 +133,7 @@ func main() {
 
 	executor := exec.New(root, st, eventHub, models, exec.Options{
 		SystemPrompt:         cfg.Executor.SystemPrompt,
+		PromptStore:          sysPrompt,
 		MaxOutputTokens:      cfg.Executor.MaxOutputTokens,
 		MaxContextBytes:      cfg.Executor.MaxContextBytes,
 		MaxRunTokens:         cfg.Executor.MaxRunTokens,
@@ -119,6 +142,7 @@ func main() {
 		StepTimeout:          cfg.Executor.StepTimeout.Std(),
 		ToolTimeout:          cfg.Tools.Timeout.Std(),
 		DailyTokensPerClient: cfg.Quota.DailyTokensPerClient,
+		DailyTokensGlobal:    cfg.Quota.GlobalDailyLimit(),
 		Tools:                tools,
 	}, logger)
 
@@ -161,6 +185,9 @@ func main() {
 		"models", strings.Join(modelNames(cfg), ","),
 		"defaultModel", cfg.DefaultModel(),
 		"maxConcurrentRuns", cfg.Executor.MaxConcurrentRuns,
+		"maxOutputTokens", cfg.Executor.MaxOutputTokens,
+		"dailyTokensGlobal", limitLabel(cfg.Quota.GlobalDailyLimit()),
+		"dailyTokensPerClient", limitLabel(cfg.Quota.DailyTokensPerClient),
 	)
 
 	go func() {
@@ -250,4 +277,37 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func watchPromptReload(root context.Context, sp *prompt.Store, logger *slog.Logger) {
+	if sp.Path() == "" {
+		return
+	}
+
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+
+	go func() {
+		defer signal.Stop(hup)
+		for {
+			select {
+			case <-root.Done():
+				return
+			case <-hup:
+				// 失败保留旧版本：写了一半的文件不该让线上从「有人设」掉到「没人设」
+				if err := sp.Reload(); err != nil {
+					logger.Error("重载 system 提示词失败，继续使用旧版本")
+					continue
+				}
+				logger.Info("system 提示词已重载", "chars", len(sp.Get()))
+			}
+		}
+	}()
+}
+
+func limitLabel(v int64) any {
+	if v <= 0 {
+		return "unlimited"
+	}
+	return v
 }

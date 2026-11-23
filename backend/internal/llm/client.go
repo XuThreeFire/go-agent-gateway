@@ -9,12 +9,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +41,7 @@ type Target struct {
 type Usage struct {
 	InputTokens  int64
 	OutputTokens int64
+	CachedTokens int64
 }
 
 // ToolSpec 是发给模型的工具声明，参数结构用 JSON Schema 描述。
@@ -80,10 +83,11 @@ type Chunk struct {
 // Content 是拼好的完整文本，ToolCalls 是按 index 归并好的调用列表——两者都由适配层产出，
 // 上层不需要再关心 SSE 的分片方式。
 type Result struct {
-	Usage      Usage
-	HTTPStatus int
-	Content    string
-	ToolCalls  []domain.ToolCall
+	Usage             Usage
+	HTTPStatus        int
+	Content           string
+	ToolCalls         []domain.ToolCall
+	PrefixFingerprint string
 }
 
 type Client interface {
@@ -92,6 +96,9 @@ type Client interface {
 }
 
 type ClientOptions struct {
+	// nil 使用代理环境变量；空 URL 强制直连；其他 URL 仅影响 LLM 出站。
+	Proxy             *url.URL
+	InsecureSkipTLS   bool
 	RequestTimeout    time.Duration // 单次调用总超时，兜住「连上了但一直不吐 token」
 	FirstTokenTimeout time.Duration // 建连 + 等响应头
 	MaxRetries        int           // 仅 429 生效，退避后最多重试一次（D-03）
@@ -113,14 +120,28 @@ func New(target Target, opt ClientOptions) Client {
 	if opt.FirstTokenTimeout <= 0 {
 		opt.FirstTokenTimeout = 60 * time.Second
 	}
+	proxy := http.ProxyFromEnvironment
+	if opt.Proxy != nil {
+		if opt.Proxy.String() == "" {
+			proxy = func(*http.Request) (*url.URL, error) { return nil, nil }
+		} else {
+			proxy = http.ProxyURL(opt.Proxy)
+		}
+	}
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 proxy,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: opt.FirstTokenTimeout,
 		MaxIdleConns:          32,
 		MaxIdleConnsPerHost:   8,
 		IdleConnTimeout:       90 * time.Second,
+	}
+	if opt.Proxy != nil && opt.Proxy.String() != "" {
+		transport.MaxIdleConnsPerHost = 2
+	}
+	if opt.InsecureSkipTLS {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	return &openAICompat{
 		target: target,
@@ -173,7 +194,11 @@ func (c *openAICompat) streamOnce(ctx context.Context, req Request, onChunk func
 	reqCtx, cancel := context.WithTimeout(ctx, c.opt.RequestTimeout)
 	defer cancel()
 
-	body, err := json.Marshal(c.buildRequest(req))
+	wire, err := c.buildRequestV3(req)
+	if err != nil {
+		return Result{}, false, fmt.Errorf("构造模型请求失败: %w", err)
+	}
+	body, err := json.Marshal(wire)
 	if err != nil {
 		return Result{}, false, fmt.Errorf("序列化请求失败: %w", err)
 	}
@@ -203,7 +228,7 @@ func (c *openAICompat) streamOnce(ctx context.Context, req Request, onChunk func
 		}
 	}
 
-	res := Result{HTTPStatus: resp.StatusCode}
+	res := Result{HTTPStatus: resp.StatusCode, PrefixFingerprint: staticPrefixFingerprint(wire)}
 	finished := false
 	finishReason := ""
 	var usage Usage
@@ -235,7 +260,7 @@ func (c *openAICompat) streamOnce(ctx context.Context, req Request, onChunk func
 			return res, streamed, errors.New("解析上游流失败：响应格式不符合 Chat Completions 协议")
 		}
 		if chunk.Usage != nil {
-			usage = Usage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}
+			usage = Usage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens, CachedTokens: chunk.Usage.cached()}
 			res.Usage = usage
 			u := usage
 			if err := onChunk(Chunk{Usage: &u}); err != nil {
@@ -283,6 +308,9 @@ func (c *openAICompat) streamOnce(ctx context.Context, req Request, onChunk func
 	}
 	for _, idx := range calls.order {
 		call := calls.byIndex[idx]
+		if strings.TrimSpace(call.Arguments) == "" {
+			call.Arguments = "{}"
+		}
 		if call.ID == "" || call.Name == "" || !json.Valid([]byte(call.Arguments)) {
 			return res, streamed, errors.New("上游工具调用缺少标识、名称或合法 JSON 参数")
 		}
@@ -348,11 +376,12 @@ func (a *callAssembler) list() []domain.ToolCall {
 }
 
 type wireRequest struct {
-	MaxTokens     int           `json:"max_tokens,omitempty"`
-	Model         string        `json:"model"`
-	Messages      []wireMessage `json:"messages"`
-	Stream        bool          `json:"stream"`
-	StreamOptions *streamOption `json:"stream_options,omitempty"`
+	MaxTokens           int           `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int           `json:"max_completion_tokens,omitempty"`
+	Model               string        `json:"model"`
+	Messages            []wireMessage `json:"messages"`
+	Stream              bool          `json:"stream"`
+	StreamOptions       *streamOption `json:"stream_options,omitempty"`
 	// Tools 为空时整个字段省略：部分供应商对「空数组 tools」也会报参数错。
 	Tools []wireTool `json:"tools,omitempty"`
 }
@@ -401,10 +430,22 @@ type wireChunk struct {
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int64 `json:"prompt_tokens"`
-		CompletionTokens int64 `json:"completion_tokens"`
-	} `json:"usage"`
+	Usage *wireUsage `json:"usage"`
+}
+type wireUsage struct {
+	PromptTokens        int64 `json:"prompt_tokens"`
+	CompletionTokens    int64 `json:"completion_tokens"`
+	PromptCacheHit      int64 `json:"prompt_cache_hit_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+func (u wireUsage) cached() int64 {
+	if u.PromptCacheHit > 0 {
+		return u.PromptCacheHit
+	}
+	return u.PromptTokensDetails.CachedTokens
 }
 
 func (c *openAICompat) buildRequest(req Request) wireRequest {
@@ -449,15 +490,26 @@ func (c *openAICompat) buildRequest(req Request) wireRequest {
 		}
 	}
 
-	return wireRequest{
-		MaxTokens: req.MaxOutputTokens,
-		Model:     c.target.UpstreamModel,
-		Messages:  wire,
-		Stream:    true,
+	return c.withOutputLimit(wireRequest{
+		Model:    c.target.UpstreamModel,
+		Messages: wire,
+		Stream:   true,
 		// 不带这个参数，多数供应商在流式模式下不返回 usage，token 统计会全是 0。
 		StreamOptions: &streamOption{IncludeUsage: true},
 		Tools:         tools,
+	}, req.MaxOutputTokens)
+}
+
+// OpenAI 使用 max_completion_tokens，其他兼容协议使用 max_tokens，避免同时发送。
+func (c *openAICompat) withOutputLimit(w wireRequest, limit int) wireRequest {
+	if limit > 0 {
+		if strings.EqualFold(c.target.Provider, "openai") {
+			w.MaxCompletionTokens = limit
+		} else {
+			w.MaxTokens = limit
+		}
 	}
+	return w
 }
 
 func parseRetryAfter(v string) time.Duration {

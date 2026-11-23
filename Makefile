@@ -16,7 +16,7 @@ build-cli:
 	@mkdir -p $(BIN)
 	go build -trimpath -o $(BIN)/cli ./cli
 run: ## 本地后端（先启动 MySQL 并 migrate）
-	go run ./backend/cmd/server -config $(CONFIG)
+	go run ./backend/cmd/server -config $(CONFIG) $(ARGS)
 cli: build-cli ## 检查后端健康
 	$(BIN)/cli health
 agent-demo: ## 无数据库、无密钥的最小 Agent 示例
@@ -63,3 +63,10 @@ release: privacy-check ## 生成仅含公开文件的源码包
 
 test-container: ## Docker 引擎就绪后，一条命令完成独立 MySQL 集成测试并清理
 	bash scripts/test-container.sh
+
+.PHONY: run-proxy reload-prompt
+run-proxy: ## 本地后端，LLM 走抓包代理；INSECURE=1 才跳过 TLS 校验
+	go run ./backend/cmd/server -config $(CONFIG) -llm-proxy "$${LLM_PROXY:-http://127.0.0.1:8888}" $(if $(filter 1,$(INSECURE)),-llm-proxy-insecure,) $(ARGS)
+reload-prompt: ## 重载当前 Compose 后端的提示词，不重启服务
+	@test -s backend/configs/prompts/system.md || (echo '默认提示词文件不存在或为空'; exit 1)
+	docker compose kill -s SIGHUP backend

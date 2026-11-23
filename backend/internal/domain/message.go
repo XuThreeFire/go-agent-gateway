@@ -2,6 +2,8 @@ package domain
 
 // Role 是对话角色。system 用于人设与规则，user/assistant 是真实轮次，
 // tool 是工具执行结果——它只在一次 Run 内部存在，不跨轮次进上下文。
+const TypeTool = "function"
+
 type Role string
 
 const (

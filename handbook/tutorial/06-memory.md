@@ -12,7 +12,7 @@
 
 ## 上下文保护
 
-`executor.system_prompt` 配置系统提示词；`max_context_bytes` 限制序列化消息大小；`max_output_tokens` 限制每次模型输出；`max_steps` 限制模型调用次数。
+默认通过 `prompt.system_file` 指定系统提示词文件；未指定文件时回落到 `executor.system_prompt`。每次 Run 开始读取一次提示词；`max_context_bytes` 限制序列化消息大小；`max_output_tokens` 限制每次模型输出；`max_steps` 限制模型调用次数。
 
 字节数不是 token 数，模型配置的 `context_window` 当前用于能力展示，不能当成精确 tokenizer 校验。超长会话会明确失败，读者可以新建会话；当前没有静默截断或自动摘要，避免在不知情时改变对话含义。
 
@@ -21,3 +21,5 @@ go test ./backend/internal/exec -v
 ```
 
 练习：把本地配置的 `max_context_bytes` 调小后重启，在长会话中观察失败。再设计一个“按完整轮次裁剪历史”的方案，说明应保留哪些 system/assistant/tool 消息。不要直接从消息数组中随意删除单条工具消息，否则会破坏调用配对。
+
+练习：在一个多步骤 Run 执行期间重载提示词，确认它仍使用旧快照，而下一个 Run 使用新内容。操作见[模型运行时参考](../reference/model-runtime.md)。

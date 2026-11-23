@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,17 +17,21 @@ import (
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/domain"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/hub"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/llm"
+	"github.com/XuThreeFire/go-agent-gateway/backend/internal/prompt"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/tool"
 )
 
 // fakeStore 同时满足 exec.Store 与 hub 的存储接口，省得为两个包各写一份假实现。
 // 刻意把「事件」和「run 状态」放在一起：取消与恢复都要断言这两者的配合。
 type fakeStore struct {
-	mu       sync.Mutex
-	runs     map[int64]*domain.Run
-	events   []domain.Event
-	usage    map[string]int64
-	clientID string
+	mu            sync.Mutex
+	runs          map[int64]*domain.Run
+	events        []domain.Event
+	usage         map[string]int64
+	clientID      string
+	appendStepErr error
+	usageErr      error
+	steps         []domain.Step
 }
 
 func newFakeStore() *fakeStore {
@@ -63,7 +70,27 @@ func (f *fakeStore) CASStatus(_ context.Context, runID int64, from, to string, p
 	return true, nil
 }
 
-func (f *fakeStore) AppendStep(context.Context, domain.Step) error { return nil }
+func (f *fakeStore) AppendStep(ctx context.Context, step domain.Step) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.appendStepErr != nil {
+		return f.appendStepErr
+	}
+	f.steps = append(f.steps, step)
+	if run := f.runs[step.RunID]; run != nil {
+		run.InputTokens += step.InputTokens
+		run.OutputTokens += step.OutputTokens
+	}
+	if step.Type == domain.StepModelCall {
+		total := step.InputTokens + step.OutputTokens
+		f.usage[globalQuotaScope+"/"+globalQuotaKey(time.Now())] += total
+		f.usage[quotaScope+"/"+quotaKey(f.clientID, time.Now())] += total
+	}
+	return nil
+}
 
 func (f *fakeStore) SetFirstToken(context.Context, int64, time.Time) error { return nil }
 
@@ -118,6 +145,9 @@ func (f *fakeStore) ClientIDOfTask(context.Context, int64) (string, error) { ret
 func (f *fakeStore) UsageTokens(_ context.Context, scope, key string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.usageErr != nil {
+		return 0, f.usageErr
+	}
 	return f.usage[scope+"/"+key], nil
 }
 
@@ -198,9 +228,11 @@ func isConflict(err error) bool {
 
 // scriptedClient 按顺序吐出预先写好的结果，用来驱动 loop 而不碰网络。
 type scriptedClient struct {
-	target llm.Target
-	steps  []llm.Result
-	reqs   []llm.Request
+	target      llm.Target
+	steps       []llm.Result
+	reqs        []llm.Request
+	streamErr   error
+	afterStream func()
 }
 
 func (c *scriptedClient) Target() llm.Target { return c.target }
@@ -216,7 +248,10 @@ func (c *scriptedClient) Stream(_ context.Context, req llm.Request, onChunk func
 			return llm.Result{}, err
 		}
 	}
-	return res, nil
+	if c.afterStream != nil {
+		c.afterStream()
+	}
+	return res, c.streamErr
 }
 
 type panicTool struct{}
@@ -454,5 +489,342 @@ func TestPublicErrorDoesNotEchoPrivateDiagnostics(t *testing.T) {
 		if strings.Contains(sanitizeMessage(err), sensitive) {
 			t.Fatal("内部诊断不得进入终态公开错误")
 		}
+	}
+}
+
+func newPromptStore(t *testing.T, content string) *prompt.Store {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "system.md")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("准备提示词文件失败: %v", err)
+	}
+	sp, err := prompt.New(path)
+	if err != nil {
+		t.Fatalf("加载提示词失败: %v", err)
+	}
+	return sp
+}
+
+// system 必须插在最前面且只有一条，同时不能改动调用方手里的切片。
+func TestWithSystemPrependsExactlyOnce(t *testing.T) {
+	e := newTestExecutor(t, newFakeStore(), Options{PromptStore: newPromptStore(t, "你是严格的技术助手")})
+
+	in := []domain.Message{
+		{Role: domain.RoleUser, Content: "第一轮"},
+		{Role: domain.RoleAssistant, Content: "第一答"},
+		{Role: domain.RoleUser, Content: "第二轮"},
+	}
+	out := e.withSystem(in)
+
+	if len(out) != len(in)+1 {
+		t.Fatalf("消息数 = %d，期望 %d（原 %d 条 + 1 条 system）", len(out), len(in)+1, len(in))
+	}
+	if out[0].Role != domain.RoleSystem || out[0].Content != "你是严格的技术助手" {
+		t.Fatalf("首条应为 system，实际 %+v", out[0])
+	}
+	for i, m := range in {
+		if out[i+1].Role != m.Role || out[i+1].Content != m.Content {
+			t.Fatalf("第 %d 条历史被改动: %+v", i, out[i+1])
+		}
+	}
+	// 不能原地插：调用方可能还持有原切片
+	if len(in) != 3 || in[0].Role != domain.RoleUser {
+		t.Fatalf("入参切片被就地修改: %+v", in)
+	}
+}
+
+// 没配提示词（nil）与配了但内容为空，都必须原样返回，不能插空 system。
+func TestWithSystemNoOpWhenUnconfigured(t *testing.T) {
+	in := []domain.Message{{Role: domain.RoleUser, Content: "hi"}}
+
+	for name, e := range map[string]*Executor{
+		"nil store":   newTestExecutor(t, newFakeStore(), Options{}),
+		"empty store": newTestExecutor(t, newFakeStore(), Options{PromptStore: &prompt.Store{}}),
+	} {
+		if out := e.withSystem(in); len(out) != 1 || out[0].Role != domain.RoleUser {
+			t.Fatalf("%s：不该插入 system，实际 %+v", name, out)
+		}
+	}
+}
+
+// 端到端校验交接点：system 经 withSystem 之后，必须真的出现在发给上游的请求里。
+// 只测 withSystem 不够——中间还隔着 loop 和 llm.buildRequest 两层。
+func TestSystemPromptReachesUpstreamRequest(t *testing.T) {
+	st := newFakeStore()
+	run := domain.Run{ID: 1, TaskID: 1, Status: domain.StatusRunning}
+	st.putRun(run)
+	e := newTestExecutor(t, st, Options{
+		MaxSteps:    2,
+		PromptStore: newPromptStore(t, "只用一句话回答"),
+	})
+
+	client := &scriptedClient{
+		target: llm.Target{Name: "m"},
+		steps:  []llm.Result{{Content: "好"}},
+	}
+	err := e.loop(context.Background(), run, client, e.withSystem([]domain.Message{
+		{Role: domain.RoleUser, Content: "介绍一下自己"},
+	}))
+	if err != nil {
+		t.Fatalf("loop 失败: %v", err)
+	}
+
+	if len(client.reqs) != 1 {
+		t.Fatalf("模型请求数 = %d，期望 1", len(client.reqs))
+	}
+	msgs := client.reqs[0].Messages
+	if len(msgs) != 2 || msgs[0].Role != domain.RoleSystem || msgs[0].Content != "只用一句话回答" {
+		t.Fatalf("上游请求的上下文不对: %+v", msgs)
+	}
+	if msgs[1].Role != domain.RoleUser {
+		t.Fatalf("第二条应为 user，实际 %s", msgs[1].Role)
+	}
+}
+
+// 全局日上限：0 表示不限；未达放行；达到拒绝；报错要说清是「全局」而不是「客户端」。
+// 文案不算小事——用户看到「全局」知道该找运维，看到「客户端」知道自己今天用多了。
+func TestCheckQuotaGlobal(t *testing.T) {
+	st := newFakeStore()
+	run := domain.Run{ID: 1, TaskID: 7}
+	key := globalQuotaKey(time.Now())
+
+	st.usage[globalQuotaScope+"/"+key] = 99
+	if e := newTestExecutor(t, st, Options{DailyTokensGlobal: 100}); e.checkQuota(context.Background(), run) != nil {
+		t.Fatal("未达全局上限不应该拦")
+	}
+
+	st.usage[globalQuotaScope+"/"+key] = 100
+	err := newTestExecutor(t, st, Options{DailyTokensGlobal: 100}).checkQuota(context.Background(), run)
+	if err == nil {
+		t.Fatal("达到全局上限应该拒绝")
+	}
+	if !strings.Contains(err.Error(), "全局") {
+		t.Fatalf("报错应指明是全局配额: %v", err)
+	}
+	if got := classifyRunError(err); got != domain.ErrQuotaExceeded {
+		t.Fatalf("应归类为 quota_exceeded，实际 %s", got)
+	}
+
+	// 0 = 不限：全局桶已经超了别的阈值，但没有上限就不该拦。
+	if e := newTestExecutor(t, st, Options{DailyTokensGlobal: 0}); e.checkQuota(context.Background(), run) != nil {
+		t.Fatal("全局上限为 0 时不应该拦")
+	}
+}
+
+// 全局闸必须排在客户端闸之前：它不依赖 task 归属，查不到 clientID 也照样拦得住。
+// 顺序写反的话，最可疑的那类请求（归属不明）恰好会先被放行、再跳过全局检查。
+func TestCheckQuotaGlobalBeforeClient(t *testing.T) {
+	st := newFakeStore()
+	run := domain.Run{ID: 1, TaskID: 7}
+
+	// 全局已触顶、客户端未触顶：应当以全局为由拒绝。
+	st.usage[globalQuotaScope+"/"+globalQuotaKey(time.Now())] = 1000
+	st.usage[quotaScope+"/"+quotaKey(st.clientID, time.Now())] = 0
+
+	err := newTestExecutor(t, st, Options{
+		DailyTokensGlobal:    1000,
+		DailyTokensPerClient: 1000,
+	}).checkQuota(context.Background(), run)
+	if err == nil {
+		t.Fatal("全局已触顶时应当拒绝")
+	}
+	if !strings.Contains(err.Error(), "全局") {
+		t.Fatalf("应当先命中全局闸，实际: %v", err)
+	}
+}
+
+func TestLoopStopsWhenCurrentRunReachesGlobalQuota(t *testing.T) {
+	st := newFakeStore()
+	run := domain.Run{ID: 1, TaskID: 1, Status: domain.StatusRunning}
+	st.putRun(run)
+	key := globalQuotaScope + "/" + globalQuotaKey(time.Now())
+	st.usage[key] = 99
+	e := newTestExecutor(t, st, Options{
+		MaxSteps: 8, DailyTokensGlobal: 100,
+		Tools: tool.New(tool.Options{}, tool.CalcTool{}),
+	})
+	client := &scriptedClient{
+		target: llm.Target{Name: "m", SupportsToolCall: true},
+		steps: []llm.Result{
+			{Usage: llm.Usage{InputTokens: 8, OutputTokens: 2}, ToolCalls: []domain.ToolCall{
+				{ID: "c", Name: "calc", Arguments: `{"expression":"1+1"}`},
+			}},
+			{Content: "不应执行第二次模型调用"},
+		},
+	}
+	err := e.loop(context.Background(), run, client, nil)
+	if err == nil || classifyRunError(err) != domain.ErrQuotaExceeded {
+		t.Fatalf("本轮入账后应触顶，实际 err=%v", err)
+	}
+	if len(client.reqs) != 1 || st.usage[key] != 109 {
+		t.Fatalf("模型调用=%d，全局用量=%d，期望 1/109", len(client.reqs), st.usage[key])
+	}
+	e.fail(context.Background(), run.ID, err)
+	if st.usage[key] != 109 {
+		t.Fatalf("失败收尾重复累计全局用量: %d", st.usage[key])
+	}
+}
+
+func TestLoopRecordsEachStepAndSendsOutputLimit(t *testing.T) {
+	st := newFakeStore()
+	run := domain.Run{ID: 1, TaskID: 1, Status: domain.StatusRunning}
+	st.putRun(run)
+	e := newTestExecutor(t, st, Options{
+		MaxOutputTokens: 123,
+		Tools:           tool.New(tool.Options{}, tool.CalcTool{}),
+	})
+	client := &scriptedClient{
+		target: llm.Target{Name: "m", SupportsToolCall: true},
+		steps: []llm.Result{
+			{Usage: llm.Usage{InputTokens: 2, OutputTokens: 1}, ToolCalls: []domain.ToolCall{
+				{ID: "c", Name: "calc", Arguments: `{"expression":"1+1"}`},
+			}},
+			{Content: "2", Usage: llm.Usage{InputTokens: 3, OutputTokens: 1}},
+		},
+	}
+	if err := e.loop(context.Background(), run, client, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.reqs) != 2 {
+		t.Fatalf("模型调用次数=%d，期望 2", len(client.reqs))
+	}
+	for i, req := range client.reqs {
+		if req.MaxOutputTokens != 123 {
+			t.Fatalf("第%d轮输出上限=%d，期望123", i+1, req.MaxOutputTokens)
+		}
+	}
+	e.complete(context.Background(), run.ID, time.Now())
+	if got := st.usage[globalQuotaScope+"/"+globalQuotaKey(time.Now())]; got != 7 {
+		t.Fatalf("全局用量=%d，期望7（工具和终态不能重复计费）", got)
+	}
+	if got := st.usage[quotaScope+"/"+quotaKey(st.clientID, time.Now())]; got != 7 {
+		t.Fatalf("客户端用量=%d，期望7", got)
+	}
+}
+
+func TestLoopStopsOnGlobalQuotaReadFailure(t *testing.T) {
+	st := newFakeStore()
+	st.usageErr = errors.New("计数器不可用")
+	e := newTestExecutor(t, st, Options{DailyTokensGlobal: 100})
+	client := &scriptedClient{}
+	err := e.loop(context.Background(), domain.Run{ID: 1}, client, nil)
+	if !errors.Is(err, st.usageErr) || len(client.reqs) != 0 {
+		t.Fatalf("全局查询失败仍请求模型，err=%v，calls=%d", err, len(client.reqs))
+	}
+	if classifyRunError(err) == domain.ErrQuotaExceeded {
+		t.Fatal("查询失败不能误报为配额耗尽")
+	}
+}
+
+func TestLoopStopsOnModelStepWriteFailure(t *testing.T) {
+	st := newFakeStore()
+	st.appendStepErr = errors.New("记账事务失败")
+	st.putRun(domain.Run{ID: 1, Status: domain.StatusRunning})
+	e := newTestExecutor(t, st, Options{Tools: tool.New(tool.Options{}, tool.CalcTool{})})
+	client := &scriptedClient{
+		target: llm.Target{Name: "m", SupportsToolCall: true},
+		steps:  []llm.Result{{ToolCalls: []domain.ToolCall{{ID: "c", Name: "calc", Arguments: `{}`}}}},
+	}
+	err := e.loop(context.Background(), domain.Run{ID: 1}, client, nil)
+	if !errors.Is(err, st.appendStepErr) || len(client.reqs) != 1 || len(st.steps) != 0 {
+		t.Fatalf("记账失败没有立即停止: err=%v，calls=%d，steps=%d", err, len(client.reqs), len(st.steps))
+	}
+}
+
+func TestRunModelStepRecordsKnownUsageOnErrorOrCancel(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		t.Run(fmt.Sprint("canceled=", canceled), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			st := newFakeStore()
+			run := domain.Run{ID: 1, TaskID: 1, Status: domain.StatusRunning}
+			st.putRun(run)
+			e := newTestExecutor(t, st, Options{})
+			streamErr := errors.New("上游断流")
+			client := &scriptedClient{
+				steps:     []llm.Result{{Usage: llm.Usage{InputTokens: 10, OutputTokens: 5}}},
+				streamErr: streamErr,
+			}
+			if canceled {
+				streamErr = context.Canceled
+				client.streamErr = streamErr
+				client.afterStream = cancel
+			}
+			_, err := e.runModelStep(ctx, run, client, nil, nil)
+			if !errors.Is(err, streamErr) {
+				t.Fatalf("流错误未保留: %v", err)
+			}
+			if got := st.usage[globalQuotaScope+"/"+globalQuotaKey(time.Now())]; got != 15 {
+				t.Fatalf("已知用量未入账: %d", got)
+			}
+			if client.reqs[0].MaxOutputTokens != 2048 {
+				t.Fatalf("默认输出上限=%d，期望2048", client.reqs[0].MaxOutputTokens)
+			}
+		})
+	}
+}
+
+func TestPromptReloadOnlyAffectsNextRun(t *testing.T) {
+	st := newFakeStore()
+	run := domain.Run{ID: 1, TaskID: 1, Status: domain.StatusRunning}
+	st.putRun(run)
+	sp := newPromptStore(t, "第一版")
+	e := newTestExecutor(t, st, Options{PromptStore: sp, Tools: tool.New(tool.Options{}, tool.CalcTool{})})
+	client := &scriptedClient{target: llm.Target{SupportsToolCall: true}, steps: []llm.Result{{ToolCalls: []domain.ToolCall{{ID: "c", Name: "calc", Arguments: `{"expression":"1+1"}`}}}, {Content: "2"}}}
+	client.afterStream = func() {
+		if len(client.reqs) == 1 {
+			if err := os.WriteFile(sp.Path(), []byte("第二版"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := sp.Reload(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := e.loop(context.Background(), run, client, e.withSystem([]domain.Message{{Role: domain.RoleUser, Content: "计算"}})); err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range client.reqs {
+		if req.Messages[0].Content != "第一版" {
+			t.Fatal("运行中提示词发生变化")
+		}
+	}
+	if next := e.withSystem(nil); next[0].Content != "第二版" {
+		t.Fatal("下次执行未读取新版提示词")
+	}
+}
+func TestCacheHitRateBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		usage llm.Usage
+		want  float64
+	}{{llm.Usage{}, 0}, {llm.Usage{InputTokens: 3, CachedTokens: 2}, 0.666}, {llm.Usage{InputTokens: 1, CachedTokens: 2}, 1}, {llm.Usage{InputTokens: 1, CachedTokens: -1}, 0}} {
+		if got := cacheHitRate(tc.usage); got != tc.want {
+			t.Fatalf("缓存命中率=%v，期望%v", got, tc.want)
+		}
+	}
+}
+
+func TestInitialGlobalQuotaReadFailureIsNotQuotaExhaustion(t *testing.T) {
+	st := newFakeStore()
+	st.usageErr = errors.New("private-fixture-diagnostic")
+	st.putRun(domain.Run{ID: 1, TaskID: 1, Status: domain.StatusPending, ModelSnapshot: []byte(`{"name":"demo"}`)})
+	e := newTestExecutor(t, st, Options{DailyTokensGlobal: 100})
+	e.models = llm.NewRegistry([]llm.Target{{Name: "demo", Provider: "mock"}}, llm.ClientOptions{})
+	e.Submit(1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := e.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	events := st.terminalEvents(1)
+	if len(events) != 1 {
+		t.Fatalf("应收敛到一个终态，实际%d", len(events))
+	}
+	var terminal domain.RunTerminalPayload
+	if err := json.Unmarshal(events[0].Payload, &terminal); err != nil {
+		t.Fatal(err)
+	}
+	if terminal.ErrorCategory != string(domain.ErrProtocol) || strings.Contains(terminal.ErrorMessage, st.usageErr.Error()) {
+		t.Fatalf("配额读取故障被误报或泄露：%+v", terminal)
 	}
 }

@@ -14,7 +14,7 @@
 
 ## 可选原生部署
 
-创建专用 gateway 系统用户，将构建后的 server、生产配置和静态资源放入 `/opt/go-agent-gateway`。参考 systemd unit 位于 `deploy/go-agent-gateway.service`；环境文件路径是 `/etc/go-agent-gateway/env`，应仅服务管理员可读。应用目录下 data 的权限仅授予服务用户。
+创建专用 gateway 系统用户，将构建后的 server、生产配置和静态资源放入 `/opt/go-agent-gateway`，并复制 `backend/configs/prompts/` 目录。参考 systemd unit 位于 `deploy/go-agent-gateway.service`；环境文件路径是 `/etc/go-agent-gateway/env`，应仅服务管理员可读。应用目录下 data 的权限仅授予服务用户。
 
 先执行迁移，再启动服务。将 `deploy/Caddyfile.go-agent-gateway` 作为站点配置参考，设置 `GATEWAY_DOMAIN`。它先通过 `forward_auth` 验证顶层页面访问，使浏览器正确显示认证提示；随后将 `/api` 与健康检查转发到回环 8080，其他路径托管 Web 静态文件。
 
@@ -27,3 +27,7 @@
 备份数据库时，备份文件属于私有数据，放在忽略目录并限制权限。数据库恢复应先在独立环境验证。`docker compose down -v` 会删除教程数据，不能作为日常停止命令。
 
 日志不输出模型密钥与原始供应商错误体；仍不要公开原始对话、数据库转储或整份生产日志。最小健康检查只确认数据库可达，不代表模型密钥有效或全部业务表已完成迁移。
+
+## 更新提示词
+
+默认提示词路径相对配置文件解析。Compose 编辑挂载的提示词目录后运行 `make reload-prompt`；原生部署发送 SIGHUP。重载失败保留旧内容，在跑的 Run 不切换版本。不要把个人提示词、真实业务样例和抓包日志提交到公开仓库。详细步骤见[模型运行时参考](reference/model-runtime.md)。

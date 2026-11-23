@@ -13,6 +13,7 @@ import (
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/domain"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/hub"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/llm"
+	"github.com/XuThreeFire/go-agent-gateway/backend/internal/prompt"
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/tool"
 )
 
@@ -49,6 +50,8 @@ func (e *ConflictError) Error() string {
 func (e *ConflictError) Is(target error) bool { return target == domain.ErrConflict }
 
 type Options struct {
+	PromptStore       *prompt.Store
+	DailyTokensGlobal int64
 	MaxConcurrentRuns int
 	SystemPrompt      string
 	MaxOutputTokens   int
@@ -280,8 +283,7 @@ func (e *Executor) execute(runID int64) {
 
 	// 配额在「拿信号量之后、迁移到 running 之前」检查：这个位置错了要么烧钱要么漏拦。
 	if err := e.checkQuota(ctx, run); err != nil {
-		e.log.Warn("配额不足，拒绝执行", "runId", runID, "err", err)
-		e.finishWithFailure(runID, domain.ErrQuotaExceeded, err.Error())
+		e.fail(ctx, runID, err)
 		return
 	}
 
@@ -309,14 +311,27 @@ func (e *Executor) execute(runID int64) {
 		return
 	}
 
-	if e.opt.SystemPrompt != "" {
-		msgs = append([]domain.Message{{Role: domain.RoleSystem, Content: e.opt.SystemPrompt}}, msgs...)
-	}
+	msgs = e.withSystem(msgs)
+
 	if err := e.loop(ctx, run, client, msgs); err != nil {
 		e.fail(ctx, runID, err)
 		return
 	}
 	e.complete(ctx, runID, startedAt)
+}
+
+// withSystem 在 Run 开头取一次快照，后续模型步骤不受热重载影响。
+func (e *Executor) withSystem(msgs []domain.Message) []domain.Message {
+	sys := e.opt.SystemPrompt
+	if e.opt.PromptStore != nil && e.opt.PromptStore.Path() != "" {
+		sys = e.opt.PromptStore.Get()
+	}
+	if sys == "" {
+		return msgs
+	}
+	out := make([]domain.Message, 0, len(msgs)+1)
+	out = append(out, domain.Message{Role: domain.RoleSystem, Content: sys})
+	return append(out, msgs...)
 }
 
 // loop 是 agent 本体：模型 → 工具 → 模型，直到模型不再要工具、或步数用尽。
@@ -346,7 +361,7 @@ func (e *Executor) loop(ctx context.Context, run domain.Run, client llm.Client, 
 			return err
 		}
 		if fresh.InputTokens+fresh.OutputTokens >= e.opt.MaxRunTokens {
-			return &quotaError{used: fresh.InputTokens + fresh.OutputTokens, limit: e.opt.MaxRunTokens}
+			return &quotaError{scope: "单次执行", used: fresh.InputTokens + fresh.OutputTokens, limit: e.opt.MaxRunTokens}
 		}
 		res, err := e.runModelStep(ctx, run, client, msgs, tools)
 		if err != nil {
@@ -465,9 +480,10 @@ func (e *Executor) runModelStep(ctx context.Context, run domain.Run, client llm.
 	wctx, cancelWrite := e.writeCtx()
 	if err := e.store.AppendStep(wctx, record); err != nil {
 		cancelWrite()
-		return res, fmt.Errorf("记录模型步骤失败")
+		return res, fmt.Errorf("记录模型步骤与用量失败: %w", err)
 	}
 	cancelWrite()
+	e.log.Info("模型调用完成", "runId", run.ID, "step", seq, "model", target.Name, "latencyMs", latency, "inputTokens", res.Usage.InputTokens, "cachedTokens", res.Usage.CachedTokens, "cacheHitRate", cacheHitRate(res.Usage), "prefixFp", res.PrefixFingerprint)
 
 	if streamErr != nil {
 		return res, streamErr
@@ -707,6 +723,9 @@ func (e *Executor) finish(runID int64, status, category, message string) {
 // quotaScope 必须与 store.ScopeClientDay 一致。这里不 import store，
 // 是为了让 exec 只依赖自己声明的接口（上层不该知道持久化包的常量）。
 const quotaScope = "client_day"
+const globalQuotaScope = "global_day"
+
+func globalQuotaKey(at time.Time) string { return "all:" + at.UTC().Format("20060102") }
 
 func quotaKey(clientID string, at time.Time) string {
 	return clientID + ":" + at.UTC().Format("20060102")
@@ -715,17 +734,35 @@ func quotaKey(clientID string, at time.Time) string {
 // quotaError 单独成型，是为了让 fail() 能把「配额触顶」和「上游出错」区分开。
 // 用 fmt.Errorf 拼字符串的话，分类只能靠字符串匹配。
 type quotaError struct {
+	scope string
 	used  int64
 	limit int64
 }
 
 func (e *quotaError) Error() string {
-	return fmt.Sprintf("今日 token 已用 %d，上限 %d，明日 UTC 零点重置", e.used, e.limit)
+	scope := e.scope
+	if scope == "" {
+		scope = "客户端"
+	}
+	if scope == "单次执行" {
+		return fmt.Sprintf("本次执行 token 已用 %d，上限 %d", e.used, e.limit)
+	}
+	return fmt.Sprintf("%s今日 token 已用 %d，上限 %d，明日 UTC 零点重置", scope, e.used, e.limit)
 }
 
 // checkQuota 判断这个客户端今天还有没有额度。
 // 启用配额后读取失败即拒绝，避免故障期间无限消耗。
 func (e *Executor) checkQuota(ctx context.Context, run domain.Run) error {
+	if limit := e.opt.DailyTokensGlobal; limit > 0 {
+		used, err := e.store.UsageTokens(ctx, globalQuotaScope, globalQuotaKey(time.Now()))
+		if err != nil {
+			return fmt.Errorf("读取全局日配额失败: %w", err)
+		}
+		if used >= limit {
+			return &quotaError{scope: "全局", used: used, limit: limit}
+		}
+	}
+
 	limit := e.opt.DailyTokensPerClient
 	if limit <= 0 {
 		return nil
@@ -862,4 +899,19 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string(r[:max]) + "..."
+}
+
+// 缓存数是供应商可选观测值，缺失时为 0；不用于费用精确结算。
+func cacheHitRate(u llm.Usage) float64 {
+	if u.InputTokens <= 0 {
+		return 0
+	}
+	r := float64(u.CachedTokens) / float64(u.InputTokens)
+	if r < 0 {
+		return 0
+	}
+	if r > 1 {
+		r = 1
+	}
+	return float64(int(r*1000)) / 1000
 }

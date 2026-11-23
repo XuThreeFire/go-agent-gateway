@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/XuThreeFire/go-agent-gateway/backend/internal/domain"
 )
@@ -67,7 +66,7 @@ func (s *Store) AppendStep(ctx context.Context, step domain.Step) error {
 			return err
 		}
 		total := step.InputTokens + step.OutputTokens
-		if total <= 0 {
+		if total <= 0 || step.Type != domain.StepModelCall {
 			return nil
 		}
 		var owner string
@@ -77,8 +76,14 @@ func (s *Store) AppendStep(ctx context.Context, step domain.Step) error {
 		if owner == "" {
 			return ErrNotFound
 		}
-		usage := usageRow{Scope: ScopeClientDay, ScopeKey: DayKey(owner, time.Now()), Tokens: total}
-		return tx.Clauses(clause.OnConflict{DoUpdates: clause.Assignments(map[string]any{"tokens": gorm.Expr("tokens + ?", total), "updated_at": time.Now().UTC()})}).Create(&usage).Error
+		txStore := &Store{db: tx}
+		if err := txStore.AddUsageTokens(ctx, ScopeGlobalDay, GlobalDayKey(row.CreatedAt), total); err != nil {
+			return fmt.Errorf("写全局日用量失败: %w", err)
+		}
+		if err := txStore.AddUsageTokens(ctx, ScopeClientDay, DayKey(owner, row.CreatedAt), total); err != nil {
+			return fmt.Errorf("写客户端日用量失败: %w", err)
+		}
+		return nil
 	})
 }
 
